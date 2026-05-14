@@ -8,11 +8,12 @@ use axum::{
 use super::{
     handlers::{
         add_credential, add_proxy, assign_proxy_to_credential, batch_add_proxies,
-        complete_social_login, delete_credential, delete_proxy, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_global_proxy, get_load_balancing_mode,
-        get_proxy_pool, poll_idc_login, poll_social_login, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_global_proxy,
-        set_load_balancing_mode, set_proxy_enabled, start_idc_login, start_social_login,
+        complete_social_login, complete_social_relogin, delete_credential, delete_proxy,
+        force_refresh_token, get_all_credentials, get_credential_balance, get_global_proxy,
+        get_load_balancing_mode, get_proxy_pool, poll_idc_login, poll_idc_relogin,
+        poll_social_login, poll_social_relogin, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_global_proxy, set_load_balancing_mode, set_proxy_enabled,
+        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         update_admin_key, update_credential, update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -70,6 +71,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/auth/social/start", post(start_social_login))
         .route("/auth/social/poll/{session_id}", post(poll_social_login))
         .route("/auth/social/complete/{session_id}", post(complete_social_login))
+        .route("/credentials/{id}/relogin/social/start", post(start_social_relogin))
+        .route("/credentials/{id}/relogin/social/poll/{session_id}", post(poll_social_relogin))
+        .route("/credentials/{id}/relogin/social/complete/{session_id}", post(complete_social_relogin))
+        .route("/credentials/{id}/relogin/idc/start", post(start_idc_relogin))
+        .route("/credentials/{id}/relogin/idc/poll/{session_id}", post(poll_idc_relogin))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

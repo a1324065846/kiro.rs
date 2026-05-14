@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Pencil } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Pencil, LogIn } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -26,6 +26,7 @@ import {
 } from '@/hooks/use-credentials'
 import { EditCredentialDialog } from '@/components/edit-credential-dialog'
 import { UpdateTokenDialog } from '@/components/update-token-dialog'
+import { ReloginDialog } from '@/components/relogin-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -66,6 +67,7 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showEditDialog, setShowEditDialog] = useState(false)
   const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false)
+  const [showReloginDialog, setShowReloginDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -311,6 +313,17 @@ export function CredentialCard({
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败
             </Button>
+            {credential.authMethod !== 'api_key' && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setShowReloginDialog(true)}
+                title="选择登录方式重新获取 Token 并刷新该凭据"
+              >
+                <LogIn className="h-4 w-4 mr-1" />
+                重新登录
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -437,6 +450,13 @@ export function CredentialCard({
       <UpdateTokenDialog
         open={showUpdateTokenDialog}
         onOpenChange={setShowUpdateTokenDialog}
+        credential={credential}
+      />
+
+      {/* 重新登录对话框 */}
+      <ReloginDialog
+        open={showReloginDialog}
+        onOpenChange={setShowReloginDialog}
         credential={credential}
       />
     </>

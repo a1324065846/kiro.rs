@@ -17,6 +17,9 @@ use super::{
     },
 };
 
+// Path 元组提取：(credential_id, session_id)
+type CredSessionPath = (u64, String);
+
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
@@ -342,6 +345,79 @@ pub async fn set_global_proxy(
 ) -> impl IntoResponse {
     match state.service.set_global_proxy(payload.proxy_url) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/relogin/social/start
+/// 发起 Social 重新登录（更新已有凭据的 Token 而非创建新凭据）
+pub async fn start_social_relogin(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<StartSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_social_relogin(id, payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/relogin/social/poll/:session_id
+/// 轮询 Social 重新登录状态
+pub async fn poll_social_relogin(
+    State(state): State<AdminState>,
+    Path((_, session_id)): Path<CredSessionPath>,
+) -> impl IntoResponse {
+    match state.service.poll_social_login(&session_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/relogin/social/complete/:session_id
+/// 远程模式下手动完成 Social 重新登录
+pub async fn complete_social_relogin(
+    State(state): State<AdminState>,
+    Path((_, session_id)): Path<CredSessionPath>,
+    Json(payload): Json<CompleteSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .complete_social_login(
+            &session_id,
+            payload.code,
+            payload.state,
+            payload.login_option,
+            payload.path,
+        )
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/relogin/idc/start
+/// 发起 IdC 重新登录（更新已有凭据的 Token 而非创建新凭据）
+pub async fn start_idc_relogin(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<StartIdcLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_idc_relogin(id, payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/relogin/idc/poll/:session_id
+/// 轮询 IdC 重新登录状态
+pub async fn poll_idc_relogin(
+    State(state): State<AdminState>,
+    Path((_, session_id)): Path<CredSessionPath>,
+) -> impl IntoResponse {
+    match state.service.poll_idc_login(&session_id).await {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

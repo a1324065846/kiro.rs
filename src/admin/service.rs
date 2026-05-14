@@ -70,6 +70,8 @@ struct SocialAuthSession {
     proxy: Option<ProxyConfig>,
     /// Drop 时自动关闭回调服务器并释放端口
     _server_handle: social::ServerHandle,
+    /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
+    relogin_target_id: Option<u64>,
 }
 
 /// IdC 设备授权会话状态
@@ -84,6 +86,8 @@ struct IdcAuthSession {
     cred_template: KiroCredentials,
     /// 用于发起 token 请求的代理
     proxy: Option<ProxyConfig>,
+    /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
+    relogin_target_id: Option<u64>,
 }
 
 impl AdminService {
@@ -799,6 +803,7 @@ impl AdminService {
             cred_template,
             proxy,
             _server_handle: server_handle,
+            relogin_target_id: None,
         };
 
         self.social_sessions
@@ -922,6 +927,16 @@ impl AdminService {
         .await
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
+        // 重新登录模式：更新已有凭据而非创建新凭据
+        if let Some(target_id) = session.relogin_target_id {
+            if let Some(refresh_token) = token.refresh_token {
+                self.do_relogin_update(target_id, refresh_token)
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            }
+            tracing::info!("Social 重新登录成功，凭据 #{} Token 已更新", target_id);
+            return Ok(PollIdcLoginResponse::Success { credential_id: target_id });
+        }
+
         let mut new_cred = session.cred_template;
         new_cred.access_token = Some(token.access_token);
         new_cred.refresh_token = token.refresh_token;
@@ -1041,6 +1056,7 @@ impl AdminService {
             poll_interval: device.interval.max(5),
             cred_template,
             proxy,
+            relogin_target_id: None,
         };
 
         let poll_interval = session.poll_interval;
@@ -1061,7 +1077,7 @@ impl AdminService {
         &self,
         session_id: &str,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
-        let (region, client_id, client_secret, device_code, expires_at, proxy, cred_template) = {
+        let (region, client_id, client_secret, device_code, _expires_at, proxy, cred_template, relogin_target_id) = {
             let sessions = self.idc_sessions.lock();
             let s = sessions
                 .get(session_id)
@@ -1079,6 +1095,7 @@ impl AdminService {
                 s.expires_at,
                 s.proxy.clone(),
                 s.cred_template.clone(),
+                s.relogin_target_id,
             )
         };
 
@@ -1096,6 +1113,18 @@ impl AdminService {
             }
             idc::PollResult::Error(e) => Err(AdminServiceError::InternalError(e.to_string())),
             idc::PollResult::Success(token) => {
+                self.idc_sessions.lock().remove(session_id);
+
+                // 重新登录模式：更新已有凭据而非创建新凭据
+                if let Some(target_id) = relogin_target_id {
+                    if let Some(refresh_token) = token.refresh_token {
+                        self.do_relogin_update(target_id, refresh_token)
+                            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                    }
+                    tracing::info!("IdC 重新登录成功，凭据 #{} Token 已更新", target_id);
+                    return Ok(PollIdcLoginResponse::Success { credential_id: target_id });
+                }
+
                 // 写入凭据
                 let mut new_cred = cred_template;
                 new_cred.access_token = Some(token.access_token);
@@ -1111,10 +1140,154 @@ impl AdminService {
                     .await
                     .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-                self.idc_sessions.lock().remove(session_id);
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
                 Ok(PollIdcLoginResponse::Success { credential_id })
             }
         }
+    }
+
+    /// 内部：重新登录完成后更新已有凭据的 Token（禁用→更新→重置→启用）
+    fn do_relogin_update(&self, target_id: u64, refresh_token: String) -> anyhow::Result<()> {
+        // 先禁用（update_refresh_token 要求凭据处于禁用状态）
+        self.token_manager.set_disabled(target_id, true)?;
+        // 更新 refreshToken（同时清空 accessToken 和 expiresAt，系统会在下次使用时自动刷新）
+        self.token_manager.update_refresh_token(target_id, refresh_token)?;
+        // 重置失败计数并重新启用
+        self.token_manager.reset_and_enable(target_id)?;
+        Ok(())
+    }
+
+    /// 发起 Social 重新登录（更新已有凭据的 Token 而非创建新凭据）
+    pub async fn start_social_relogin(
+        &self,
+        target_id: u64,
+        req: StartSocialLoginRequest,
+    ) -> Result<StartSocialLoginResponse, AdminServiceError> {
+        // 验证目标凭据存在
+        {
+            let snapshot = self.token_manager.snapshot();
+            if !snapshot.entries.iter().any(|e| e.id == target_id) {
+                return Err(AdminServiceError::NotFound { id: target_id });
+            }
+        }
+
+        let global_proxy = self.token_manager.proxy();
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let auth_endpoint = req
+            .auth_endpoint
+            .unwrap_or_else(|| social::KIRO_AUTH_ENDPOINT.to_string());
+
+        let (code_verifier, code_challenge) = social::generate_pkce();
+        let state = uuid::Uuid::new_v4().to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+
+        let (port, server_handle) = social::start_callback_server(tx)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let redirect_uri = format!("http://127.0.0.1:{}", port);
+        let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
+
+        let expires_at = Utc::now() + Duration::minutes(10);
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let session = SocialAuthSession {
+            auth_endpoint,
+            state,
+            code_verifier,
+            redirect_uri,
+            expires_at,
+            callback_rx: tokio::sync::Mutex::new(rx),
+            cred_template: KiroCredentials::default(),
+            proxy,
+            _server_handle: server_handle,
+            relogin_target_id: Some(target_id),
+        };
+
+        self.social_sessions
+            .lock()
+            .insert(session_id.clone(), session);
+
+        Ok(StartSocialLoginResponse {
+            session_id,
+            portal_url,
+            expires_at: expires_at.to_rfc3339(),
+        })
+    }
+
+    /// 发起 IdC 重新登录（更新已有凭据的 Token 而非创建新凭据）
+    pub async fn start_idc_relogin(
+        &self,
+        target_id: u64,
+        req: StartIdcLoginRequest,
+    ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        // 验证目标凭据存在
+        {
+            let snapshot = self.token_manager.snapshot();
+            if !snapshot.entries.iter().any(|e| e.id == target_id) {
+                return Err(AdminServiceError::NotFound { id: target_id });
+            }
+        }
+
+        let config = self.token_manager.config();
+        let global_proxy = self.token_manager.proxy();
+
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let start_url = req
+            .start_url
+            .as_deref()
+            .unwrap_or(BUILDER_ID_START_URL);
+
+        let reg = idc::register_client(&req.region, config, proxy.as_ref())
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let device = idc::start_device_authorization(
+            &req.region,
+            start_url,
+            &reg.client_id,
+            &reg.client_secret,
+            config,
+            proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let expires_at = Utc::now() + Duration::seconds(device.expires_in);
+        let session_id = Uuid::new_v4().to_string();
+
+        let session = IdcAuthSession {
+            region: req.region,
+            client_id: reg.client_id,
+            client_secret: reg.client_secret,
+            device_code: device.device_code,
+            expires_at,
+            poll_interval: device.interval.max(5),
+            cred_template: KiroCredentials::default(),
+            proxy,
+            relogin_target_id: Some(target_id),
+        };
+
+        let poll_interval = session.poll_interval;
+        self.idc_sessions.lock().insert(session_id.clone(), session);
+
+        Ok(StartIdcLoginResponse {
+            session_id,
+            user_code: device.user_code,
+            verification_uri: device.verification_uri,
+            verification_uri_complete: device.verification_uri_complete,
+            expires_at: expires_at.to_rfc3339(),
+            poll_interval,
+        })
     }
 }

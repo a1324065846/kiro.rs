@@ -236,3 +236,64 @@ export async function completeSocialLogin(
   const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/complete/${sessionId}`, req)
   return data
 }
+
+// ============ 重新登录（更新已有凭据 Token） ============
+
+// 发起 Social 重新登录
+export async function startSocialRelogin(
+  credentialId: number,
+  req: StartSocialLoginRequest
+): Promise<StartSocialLoginResponse> {
+  const { data } = await api.post<StartSocialLoginResponse>(
+    `/credentials/${credentialId}/relogin/social/start`,
+    req
+  )
+  return data
+}
+
+// 轮询 Social 重新登录状态
+export async function pollSocialRelogin(
+  credentialId: number,
+  sessionId: string
+): Promise<PollSocialLoginResponse> {
+  const { data } = await api.post<PollSocialLoginResponse>(
+    `/credentials/${credentialId}/relogin/social/poll/${sessionId}`
+  )
+  return data
+}
+
+// 手动完成 Social 重新登录（远程访问时粘贴回调 URL）
+export async function completeSocialRelogin(
+  credentialId: number,
+  sessionId: string,
+  req: CompleteSocialLoginRequest
+): Promise<PollSocialLoginResponse> {
+  const { data } = await api.post<PollSocialLoginResponse>(
+    `/credentials/${credentialId}/relogin/social/complete/${sessionId}`,
+    req
+  )
+  return data
+}
+
+// 发起 IdC 重新登录
+export async function startIdcRelogin(
+  credentialId: number,
+  req: StartIdcLoginRequest
+): Promise<StartIdcLoginResponse> {
+  const { data } = await api.post<StartIdcLoginResponse>(
+    `/credentials/${credentialId}/relogin/idc/start`,
+    req
+  )
+  return data
+}
+
+// 轮询 IdC 重新登录状态
+export async function pollIdcRelogin(
+  credentialId: number,
+  sessionId: string
+): Promise<PollIdcLoginResponse> {
+  const { data } = await api.post<PollIdcLoginResponse>(
+    `/credentials/${credentialId}/relogin/idc/poll/${sessionId}`
+  )
+  return data
+}
