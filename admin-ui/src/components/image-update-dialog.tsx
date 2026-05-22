@@ -312,6 +312,13 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
                 </div>
               )}
 
+              {data?.lastAppliedAt && (
+                <div className="text-xs text-muted-foreground">
+                  上次更新于：
+                  <span className="font-mono">{formatDateTime(data.lastAppliedAt)}</span>
+                </div>
+              )}
+
               <div className="flex items-start justify-between gap-3">
                 <div className="text-xs">
                   <div className="font-medium text-foreground">无人值守自动更新</div>

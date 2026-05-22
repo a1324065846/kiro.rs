@@ -372,6 +372,9 @@ pub struct UpdateConfigResponse {
     /// 上一次成功更新前正在运行的版本号（带 `v` 前缀），存在时前端可显示「回退」按钮。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_version: Option<String>,
+    /// 上一次成功完成在线更新的时间（RFC3339）；用于前端显示「上次更新于 …」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_applied_at: Option<String>,
     /// 是否开启无人值守自动更新
     pub auto_apply: bool,
     /// 自动更新触发时间（本地时区，HH:MM 24 小时制）

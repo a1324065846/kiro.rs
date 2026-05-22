@@ -99,6 +99,10 @@ pub struct Config {
     #[serde(default)]
     pub update_previous_version: Option<String>,
 
+    /// 上一次成功完成在线更新的时间（RFC3339）。前端用于显示「上次更新于 …」。
+    #[serde(default)]
+    pub update_last_applied_at: Option<String>,
+
     /// 是否启用无人值守自动更新。开启后服务会在每天的 `update_auto_apply_time`
     /// 时刻检查 GitHub Releases，发现新版本即自动下载二进制并替换重启。
     #[serde(default)]
@@ -223,6 +227,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             update_previous_version: None,
+            update_last_applied_at: None,
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             redis_url: None,

@@ -170,6 +170,8 @@ export interface SetGlobalProxyRequest {
 export interface UpdateConfigResponse {
   /** 上一次更新前正在运行的版本号（带 v 前缀）；存在时可调用回退接口 */
   previousVersion?: string
+  /** 上一次成功完成在线更新的时间（RFC3339） */
+  lastAppliedAt?: string
   /** 是否开启无人值守自动更新 */
   autoApply: boolean
   /** 自动更新触发时间（本地时区，HH:MM 24 小时制） */

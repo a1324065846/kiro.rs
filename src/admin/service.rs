@@ -58,6 +58,7 @@ struct CachedUpdateCheck {
 #[derive(Debug, Clone)]
 struct RuntimeUpdateConfig {
     previous_version: Option<String>,
+    last_applied_at: Option<String>,
     auto_apply: bool,
     auto_apply_time: String,
 }
@@ -66,6 +67,7 @@ impl RuntimeUpdateConfig {
     fn from_config(config: &Config) -> Self {
         Self {
             previous_version: config.update_previous_version.clone(),
+            last_applied_at: config.update_last_applied_at.clone(),
             auto_apply: config.update_auto_apply,
             auto_apply_time: config.update_auto_apply_time.clone(),
         }
@@ -74,6 +76,7 @@ impl RuntimeUpdateConfig {
     fn response(&self) -> UpdateConfigResponse {
         UpdateConfigResponse {
             previous_version: self.previous_version.clone(),
+            last_applied_at: self.last_applied_at.clone(),
             auto_apply: self.auto_apply,
             auto_apply_time: self.auto_apply_time.clone(),
         }
@@ -873,10 +876,17 @@ impl AdminService {
         super::binary_update::install_binary(&exe, &staged)?;
 
         let prev_label = format!("v{}", previous_version);
-        self.update_config.lock().previous_version = Some(prev_label.clone());
+        let applied_at = chrono::Utc::now().to_rfc3339();
+        {
+            let mut runtime = self.update_config.lock();
+            runtime.previous_version = Some(prev_label.clone());
+            runtime.last_applied_at = Some(applied_at.clone());
+        }
         let prev_to_persist = prev_label.clone();
+        let applied_at_to_persist = applied_at.clone();
         self.update_config_file(move |c| {
             c.update_previous_version = Some(prev_to_persist);
+            c.update_last_applied_at = Some(applied_at_to_persist);
         });
 
         super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
@@ -915,10 +925,15 @@ impl AdminService {
         let exe = super::binary_update::current_executable()?;
         super::binary_update::restore_backup(&exe)?;
 
-        // 清空 previous_version 避免连续回退指向不存在的版本
-        self.update_config.lock().previous_version = None;
+        // 回退视为撤销最近一次更新：清空 previous_version 和 last_applied_at
+        {
+            let mut runtime = self.update_config.lock();
+            runtime.previous_version = None;
+            runtime.last_applied_at = None;
+        }
         self.update_config_file(|c| {
             c.update_previous_version = None;
+            c.update_last_applied_at = None;
         });
 
         super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
