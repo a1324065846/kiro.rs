@@ -10,6 +10,8 @@ use axum::{
 };
 use parking_lot::RwLock;
 
+use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -31,7 +33,7 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
 ) -> Router {
     let shared_key = Arc::new(RwLock::new(api_key.into()));
-    create_router_with_shared_key(shared_key, kiro_provider, extract_thinking)
+    create_router_with_shared_key(shared_key, kiro_provider, extract_thinking, None, None, None)
 }
 
 /// 与 `create_router_with_provider` 相同，但允许调用方共享 api_key 内存
@@ -40,11 +42,15 @@ pub fn create_router_with_shared_key(
     api_key: Arc<RwLock<String>>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    client_keys: Option<SharedClientKeyManager>,
+    usage_recorder: Option<SharedRecorder>,
+    usage_aggregator: Option<SharedAggregator>,
 ) -> Router {
     let mut state = AppState::with_shared_api_key(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
+    state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

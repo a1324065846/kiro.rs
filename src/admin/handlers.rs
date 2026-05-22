@@ -7,14 +7,17 @@ use axum::{
 };
 
 use super::{
+    client_keys::mask_client_key,
     middleware::AdminState,
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, BatchAddProxyRequest,
-        CompleteSocialLoginRequest, GlobalProxyResponse, SetDisabledRequest, SetGlobalProxyRequest,
+        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
+        CreateClientKeyResponse, GlobalProxyResponse, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetUpdateConfigRequest,
         StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
+    usage_stats::Range,
 };
 
 // Path 元组提取：(credential_id, session_id)
@@ -601,4 +604,238 @@ pub async fn update_api_key(
     *state.api_key.write() = new_key.clone();
     state.service.persist_api_key(&new_key);
     Json(SuccessResponse::new("API Key 已更新")).into_response()
+}
+
+// ============ 客户端 API Key 分发 ============
+
+fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
+    ClientKeyItem {
+        id: k.id,
+        masked_key: mask_client_key(&k.key),
+        name: k.name.clone(),
+        description: k.description.clone(),
+        disabled: k.disabled,
+        created_at: k.created_at.clone(),
+        last_used_at: k.last_used_at.clone(),
+        total_calls: k.total_calls,
+        total_input_tokens: k.total_input_tokens,
+        total_output_tokens: k.total_output_tokens,
+        total_cache_creation_tokens: k.total_cache_creation_tokens,
+        total_cache_read_tokens: k.total_cache_read_tokens,
+    }
+}
+
+/// GET /api/admin/client-keys
+pub async fn list_client_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    let keys = state.client_keys.list();
+    let items: Vec<ClientKeyItem> = keys.iter().map(key_to_item).collect();
+    Json(ClientKeysResponse {
+        total: items.len(),
+        keys: items,
+    })
+}
+
+/// POST /api/admin/client-keys
+pub async fn create_client_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateClientKeyRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "name 不能为空",
+            )),
+        )
+            .into_response();
+    }
+    let entry = state.client_keys.create(
+        name.to_string(),
+        payload
+            .description
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
+    );
+    Json(CreateClientKeyResponse {
+        id: entry.id,
+        key: entry.key,
+        name: entry.name,
+        created_at: entry.created_at,
+    })
+    .into_response()
+}
+
+/// DELETE /api/admin/client-keys/:id
+pub async fn delete_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if state.client_keys.delete(id) {
+        Json(SuccessResponse::new(format!("Key #{} 已删除", id))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
+}
+
+/// PUT /api/admin/client-keys/:id
+pub async fn update_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateClientKeyRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    let description = payload
+        .description
+        .map(|d| if d.is_empty() { None } else { Some(d) });
+    if state.client_keys.update_meta(id, payload.name, description) {
+        Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
+}
+
+/// POST /api/admin/client-keys/:id/disabled
+pub async fn set_client_key_disabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetDisabledRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if state.client_keys.set_disabled(id, payload.disabled) {
+        let action = if payload.disabled { "禁用" } else { "启用" };
+        Json(SuccessResponse::new(format!("Key #{} 已{}", id, action))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
+}
+
+/// POST /api/admin/client-keys/:id/reset-stats
+pub async fn reset_client_key_stats(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if state.client_keys.reset_stats(id) {
+        Json(SuccessResponse::new(format!("Key #{} 统计已重置", id))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
+}
+
+// ============ 用量统计 ============
+
+fn parse_range(params: &std::collections::HashMap<String, String>) -> Range {
+    params
+        .get("range")
+        .map(|s| Range::parse(s.as_str()))
+        .unwrap_or(Range::Last24h)
+}
+
+/// GET /api/admin/stats/overview
+pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoResponse {
+    let mut overview = state.usage_aggregator.overview();
+    // 附加：当前活跃 Key / 凭据数
+    let active_keys = state.client_keys.active_count() as u64;
+    let snapshot = state.service.get_all_credentials();
+    let active_credentials = snapshot
+        .credentials
+        .iter()
+        .filter(|c| !c.disabled)
+        .count() as u64;
+    let response = serde_json::json!({
+        "todayCalls": overview.today_calls,
+        "todayInputTokens": overview.today_input_tokens,
+        "todayOutputTokens": overview.today_output_tokens,
+        "todayErrors": overview.today_errors,
+        "weekCalls": overview.week_calls,
+        "weekInputTokens": overview.week_input_tokens,
+        "weekOutputTokens": overview.week_output_tokens,
+        "activeClientKeys": active_keys,
+        "activeCredentials": active_credentials,
+    });
+    // 额外引用 overview 字段以避免编译器错误
+    let _ = (&mut overview).today_calls;
+    Json(response)
+}
+
+/// GET /api/admin/stats/timeseries?range=24h|7d|30d
+pub async fn stats_timeseries(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let range = parse_range(&params);
+    let points = state.usage_aggregator.query_timeseries(range);
+    Json(points)
+}
+
+/// GET /api/admin/stats/by-model?range=24h|7d|30d
+pub async fn stats_by_model(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let range = parse_range(&params);
+    let data = state.usage_aggregator.query_by_model(range);
+    Json(data)
+}
+
+/// GET /api/admin/stats/by-credential?range=24h|7d|30d
+pub async fn stats_by_credential(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let range = parse_range(&params);
+    // 拉一份凭据快照，把 email 附加到响应里方便前端展示
+    let snapshot = state.service.get_all_credentials();
+    let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
+        .credentials
+        .iter()
+        .map(|c| (c.id, c.email.clone()))
+        .collect();
+    let data = state.usage_aggregator.query_by_credential(range);
+    let enriched: Vec<serde_json::Value> = data
+        .into_iter()
+        .map(|d| {
+            let email = email_map.get(&d.credential_id).cloned().flatten();
+            serde_json::json!({
+                "credentialId": d.credential_id,
+                "email": email,
+                "calls": d.calls,
+                "inputTokens": d.input_tokens,
+                "outputTokens": d.output_tokens,
+                "errors": d.errors,
+            })
+        })
+        .collect();
+    Json(enriched)
 }

@@ -1308,6 +1308,23 @@ impl BufferedStreamContext {
 
         std::mem::take(&mut self.event_buffer)
     }
+
+    /// 取出最终用量（在 finish_and_get_all_events 之后调用）
+    ///
+    /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+    pub fn final_usage(&self) -> (i32, i32, i32, i32) {
+        let final_input = resolve_usage_input_tokens(
+            self.estimated_input_tokens,
+            self.inner.context_input_tokens,
+            &self.inner.cache_result,
+        );
+        (
+            final_input,
+            self.inner.output_tokens,
+            self.inner.cache_result.cache_creation_input_tokens,
+            self.inner.cache_result.cache_read_input_tokens,
+        )
+    }
 }
 
 /// 简单的 token 估算

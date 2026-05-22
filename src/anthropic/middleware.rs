@@ -11,10 +11,19 @@ use axum::{
 };
 use parking_lot::RwLock;
 
+use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
 use super::types::ErrorResponse;
+
+/// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
+#[derive(Clone, Copy, Debug)]
+pub struct KeyContext {
+    /// 命中的客户端 Key id；0 表示用 master apiKey 调用
+    pub key_id: u64,
+}
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -26,6 +35,12 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 客户端 Key 管理器（可选，未启用 Admin 时为 None）
+    pub client_keys: Option<SharedClientKeyManager>,
+    /// 用量日志记录器
+    pub usage_recorder: Option<SharedRecorder>,
+    /// 用量聚合器
+    pub usage_aggregator: Option<SharedAggregator>,
 }
 
 impl AppState {
@@ -39,6 +54,9 @@ impl AppState {
             api_key: Arc::new(RwLock::new(api_key.into())),
             kiro_provider: None,
             extract_thinking,
+            client_keys: None,
+            usage_recorder: None,
+            usage_aggregator: None,
         }
     }
 
@@ -48,6 +66,9 @@ impl AppState {
             api_key,
             kiro_provider: None,
             extract_thinking,
+            client_keys: None,
+            usage_recorder: None,
+            usage_aggregator: None,
         }
     }
 
@@ -56,22 +77,55 @@ impl AppState {
         self.kiro_provider = Some(Arc::new(provider));
         self
     }
+
+    /// 注入用量记录组件
+    pub fn with_usage(
+        mut self,
+        client_keys: Option<SharedClientKeyManager>,
+        recorder: Option<SharedRecorder>,
+        aggregator: Option<SharedAggregator>,
+    ) -> Self {
+        self.client_keys = client_keys;
+        self.usage_recorder = recorder;
+        self.usage_aggregator = aggregator;
+        self
+    }
 }
 
 /// API Key 认证中间件
+///
+/// 鉴权顺序：master apiKey → 客户端 Key（`csk_*`）。命中后向请求扩展注入
+/// [`KeyContext`]，供 handler 记录用量时使用。
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let current = state.api_key.read().clone();
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &current) => next.run(request).await,
-        _ => {
+    let presented = match auth::extract_api_key(&request) {
+        Some(k) => k,
+        None => {
             let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+        }
+    };
+
+    // 1) master apiKey
+    let master = state.api_key.read().clone();
+    if auth::constant_time_eq(&presented, &master) {
+        request.extensions_mut().insert(KeyContext { key_id: 0 });
+        return next.run(request).await;
+    }
+
+    // 2) 客户端 Key
+    if let Some(mgr) = &state.client_keys {
+        if let Some(id) = mgr.verify_and_touch(&presented) {
+            request.extensions_mut().insert(KeyContext { key_id: id });
+            return next.run(request).await;
         }
     }
+
+    let error = ErrorResponse::authentication_error();
+    (StatusCode::UNAUTHORIZED, Json(error)).into_response()
 }
 
 /// CORS 中间件层

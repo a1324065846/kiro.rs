@@ -178,6 +178,33 @@ async fn main() {
         }
     }
 
+    // 客户端 Key 管理器 + 用量记录器 + 聚合器（与凭据文件同目录）
+    let cache_dir = token_manager
+        .cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
+    let client_key_manager = std::sync::Arc::new(
+        admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
+            tracing::warn!("加载客户端 Key 失败 ({}): {}", client_keys_path.display(), e);
+            admin::ClientKeyManager::new()
+        }),
+    );
+    let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::new(cache_dir.clone()));
+    let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
+    usage_aggregator.rebuild_from_logs(&cache_dir);
+    // 启动后定期清理过期 usage_log
+    {
+        let recorder = usage_recorder.clone();
+        tokio::spawn(async move {
+            let day = std::time::Duration::from_secs(24 * 3600);
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                recorder.cleanup_old_logs();
+                tokio::time::sleep(day).await;
+            }
+        });
+    }
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     // 把 api_key 包成 Arc<RwLock<...>>，以便 Admin 模块运行时改 key 后立刻生效
     let shared_api_key = std::sync::Arc::new(parking_lot::RwLock::new(api_key.clone()));
@@ -185,6 +212,9 @@ async fn main() {
         shared_api_key.clone(),
         Some(kiro_provider),
         config.extract_thinking,
+        Some(client_key_manager.clone()),
+        Some(usage_recorder.clone()),
+        Some(usage_aggregator.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -206,6 +236,8 @@ async fn main() {
                 admin_key,
                 shared_api_key.clone(),
                 admin_service,
+                client_key_manager.clone(),
+                usage_aggregator.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）

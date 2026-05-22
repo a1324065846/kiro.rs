@@ -4,13 +4,59 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
 ## [0.3.2] - 2026-05-22
 
-主题：把在线更新对话框打磨成可日常使用的工具——加入 GitHub Token 配置消除限流问题，加入版本验证防止重复更新，加入 staged 复用让两步操作变成无缝衔接，并清理视觉噪音。
+主题：把 kiro.rs 从「单 Key 的 Anthropic 协议适配器」推进到Key分发场景 ——加入面向下游用户的客户端 Key 分发、按 Key/凭据/模型维度的 Token 用量统计与仪表盘趋势可视化；同时把在线更新对话框打磨成可日常使用的工具，加入 GitHub Token 配置消除限流问题、加入版本验证防止重复更新、加入 staged 复用让两步操作变成无缝衔接。
 
-### ✨ 新功能
+### ✨ 新功能 — 客户端 API Key 分发
+
+- **新的两层 Key 模型**：`config.apiKey`（master）保留向后兼容，新增 `csk_*` 客户端 Key 层。每把 Key 独立启用/禁用、独立计数，泄露后只需替换一把而非全员换 master。
+  - 持久化到 `client_api_keys.json`（与 `credentials.json` 同目录），无 SQLite 依赖
+  - `subtle::ConstantTimeEq` 全表常量时间比对，防 HashMap 短路引发的时序攻击
+  - 鉴权顺序：master apiKey → 客户端 Key；命中后通过 `Extension(KeyContext { key_id })` 注入下游 handler
+- **Admin API**：6 个新端点
+  - `GET /api/admin/client-keys` 列表（脱敏展示 `csk_abcd...mnop`）
+  - `POST /api/admin/client-keys` 创建（响应里返回明文 key，**仅此一次**）
+  - `PUT /api/admin/client-keys/:id` 改名 / 改描述
+  - `DELETE /api/admin/client-keys/:id` 删除
+  - `POST /api/admin/client-keys/:id/disabled` 启用/禁用
+  - `POST /api/admin/client-keys/:id/reset-stats` 重置累计计数
+- **新前端 Tab「客户端 Key」**：表格展示名称、脱敏 Key、状态、总调用、总输入/输出 Token、最后使用时间、操作按钮；新建后弹出明文一次性展示对话框（带显示/隐藏切换、复制按钮）。
+
+### ✨ 新功能 — Token 用量统计与仪表盘
+
+- **请求级用量记录**：`/v1/messages` 流式 / 缓冲流式 / 非流式三条路径在结束（含错误）时统一写入用量。`KiroProvider` 改造返回 `KiroCallResult { response, credential_id }`，把命中凭据 ID 透传到 handler 用于按上游凭据维度聚合。
+- **JSONL 持久化 + 内存聚合**：
+  - `usage_log.YYYY-MM-DD.jsonl` 按日滚动，单行一条记录（ts/keyId/credentialId/model/inputTokens/outputTokens/cacheCreation/cacheRead/durationMs/status）
+  - `UsageAggregator` 维护 168 小时桶 + 31 天桶的 ring buffer，启动时从历史 JSONL 重建，重启不丢趋势
+  - 后台任务每 24 小时清理超过 31 天的旧日志
+- **统计 API**：4 个新端点
+  - `GET /api/admin/stats/overview` — 今日 / 最近 7 天的调用次数、Token、错误数 + 活跃 Key/凭据数
+  - `GET /api/admin/stats/timeseries?range=24h|7d|30d` — 按桶聚合的时序点
+  - `GET /api/admin/stats/by-model?range=...` — 各模型的 calls / input / output 排行
+  - `GET /api/admin/stats/by-credential?range=...` — 各上游凭据贡献，附 email
+- **新前端 Tab「概览」**：4 张统计卡片 + 三类图表
+  - 时间 × Token 折线图（input/output/cacheRead/cacheCreation 四条线）
+  - 按模型分布饼图 + 详情表
+  - 按上游凭据堆叠柱图（Top 12）
+  - 右上 24h / 7d / 30d 切换器
+- **客户端 Key 维度的累计**：成功请求会同时把 input/output/cacheCreation/cacheRead 累加到对应客户端 Key 的总数，列表页直接看到每把 Key 的总消耗。
+
+### 🎨 界面 — 多 Tab 导航 + 顶栏统一
+
+- **从单 Dashboard 改为三 Tab SPA**：概览（默认）/ 凭据管理 / 客户端 Key。`App.tsx` 顶栏内置 Tab，URL hash（`#/overview` / `#/credentials` / `#/keys`）同步，未引入 react-router。
+- **`TopbarTools` 工具组件**：把"负载均衡切换 / 刷新 / 在线更新 / 设置（含 Key 修改对话框）"从凭据管理 Tab 抽到 App 顶栏，三个 Tab 都可访问；刷新按钮一次性失效凭据 / 客户端 Key / stats 三类查询。
+- **响应式 Tab 行**：桌面端 Tab 在 logo 旁，移动端折到顶栏第二行。
+- **Dashboard 嵌入模式**：新增 `embedded` prop，在 Tab 内渲染时隐藏自带顶栏、跳过外层 padding，避免与 App 顶栏重复。
+
+### 🛠 性能 / 体验
+
+- **图表渲染优化**：三个 chart 全部 `React.memo` + `useMemo` 稳定 props 引用，关闭 recharts 默认 1.5s 入场动画；时序图根据点数自动稀疏 X 轴 ticks（≤12 全显，≤48 取 12 个，更长取 16 个）避免标签重叠引发的反复布局测量。
+- **数据查询节流**：所有 stats hook 加 `staleTime: 25s`（30s refetchInterval 之内切 Tab 不重复请求）+ `placeholderData: keepPreviousData`（切 range 期间复用旧数据避免 chart 卸载重挂）+ `refetchOnWindowFocus: false`（避免窗口聚焦同时打 4 个请求）。
+- **图表 Tooltip 暗色主题**：抽出 `tooltip-style.ts` 共享样式，`labelStyle` / `itemStyle` 单独设白色——recharts 不让 label/item 继承 `contentStyle.color`，这是之前看不清的根因。
+- **柱图布局修复**：图例从底部移到右上，X 轴 `height: 56` + bottom margin `48`，避免「输入/输出」图例覆盖倾斜的 X 轴标签。
+
+### ✨ 新功能 — 在线更新对话框打磨
 
 - **GitHub Token 配置**：在线更新对话框新增 GitHub Personal Access Token 输入区，保存后所有 GitHub API 调用都会带上 `Authorization: Bearer <token>`，把限流从匿名 60/小时 提升到认证 5000/小时。匿名访问触发 `403 API rate limit exceeded` 时不再无解。
   - 配置文件新增 `githubToken` 字段（顶层）
@@ -21,17 +67,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
   - 剩余次数低于上限 5% 时进度条变 amber 提醒
 - **「上次更新于」时间戳**：apply 成功后记录 RFC3339 时间到 `updateLastAppliedAt` 字段，对话框展示「上次更新于：YYYY-MM-DD HH:MM:SS」（本地时区）。回退时清空。
 
-### 🛠 体验优化
+### 🛠 在线更新体验优化
 
 - **拉取镜像 → 更新并重启 复用 staged**：「拉取镜像」按钮不再是死功能。下载产物保存到 `<exe>.staged-<version>`，「更新并重启」检测到同版本 staged 时直接 install + exit，跳过重复下载。两步操作之间几乎无感知延迟。
 - **当前已是最新版本时禁用「更新并重启」**：避免对相同版本做无意义的下载-替换-重启。后端在 `apply_image_update` 入口加版本检查，前端按钮根据 `hasUpdate` 同步禁用，鼠标悬停显示原因。
 - **GitHub Token Scopes 不再展示**：原本会把 token 的 OAuth scopes 列出来（如 `admin:org, repo, ...`），是不必要的权限信息泄露。后端不再读取 `X-OAuth-Scopes` header，前端不再显示 Scopes 行。
 
-### 🎨 界面调整
+### 🎨 在线更新对话框扁平化
 
 - **更新对话框扁平化**：移除外层卡片包装与 4 层嵌套边框，三个分区改为 `<section>` + `border-t pt-4` 顶分隔线。
 - **取消「有更新」时整块变黄**：原本有更新时整个面板背景变 amber，已经有绿色「可更新」徽章传达同样信息。现在面板始终是中性背景，只保留徽章。
 - **限流摘要卡内嵌**：限流状态展示不再是独立带边框的卡片，而是直接平铺在 GitHub Token 区下方，仅用图标颜色（绿/红）和进度条颜色（绿/黄）区分状态。
+
+### 📦 依赖 / 构建
+
+- **新增前端依赖**：`recharts ^2.15`（仪表盘图表，~95KB gzip）。
+- **`.gitignore` 新增 4 类条目**：`client_api_keys.json`（含明文 csk）、`usage_log.*.jsonl`、`usage_stats.json`、`*.staged-*` / `*.backup`（在线更新产物）。
+
+### 📦 升级指南
+
+1. **现有部署直接 `docker compose pull && docker compose up -d`**，旧 master `apiKey` 完全兼容，所有现有客户端无需改动。
+2. **想用客户端 Key 分发**：登录 Admin 面板 → 切到「客户端 Key」Tab → 新建 → 把弹窗里的明文 `csk_xxx` 给下游用户，让客户端把它放进 `x-api-key` 或 `Authorization: Bearer` 头。
+3. **想看仪表盘**：`/admin` → 概览 Tab，新部署默认无历史数据，发起几次请求即可看到趋势开始填充。
+4. **历史日志**：服务启动时自动从 `usage_log.*.jsonl` 重建近 31 天聚合，无需迁移脚本。
 
 ## [0.3.1] - 2026-05-22
 

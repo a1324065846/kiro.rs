@@ -280,3 +280,86 @@ export interface StartSocialLoginResponse {
 }
 
 export type PollSocialLoginResponse = PollIdcLoginResponse
+
+// ============ 客户端 API Key 分发 ============
+
+export interface ClientKeyItem {
+  id: number
+  /** 脱敏后的 Key（仅展示） */
+  maskedKey: string
+  name: string
+  description?: string
+  disabled: boolean
+  createdAt: string
+  lastUsedAt?: string
+  totalCalls: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  totalCacheCreationTokens: number
+  totalCacheReadTokens: number
+}
+
+export interface ClientKeysResponse {
+  total: number
+  keys: ClientKeyItem[]
+}
+
+export interface CreateClientKeyRequest {
+  name: string
+  description?: string
+}
+
+/** 创建响应：明文 Key 仅在此处返回一次 */
+export interface CreateClientKeyResponse {
+  id: number
+  key: string
+  name: string
+  createdAt: string
+}
+
+export interface UpdateClientKeyRequest {
+  name?: string
+  description?: string
+}
+
+// ============ 用量统计 ============
+
+export type StatsRange = '24h' | '7d' | '30d'
+
+export interface OverviewStats {
+  todayCalls: number
+  todayInputTokens: number
+  todayOutputTokens: number
+  todayErrors: number
+  weekCalls: number
+  weekInputTokens: number
+  weekOutputTokens: number
+  activeClientKeys: number
+  activeCredentials: number
+}
+
+export interface TimeSeriesPoint {
+  ts: string
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  calls: number
+  errors: number
+}
+
+export interface ModelDistribution {
+  model: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+}
+
+export interface CredentialDistribution {
+  credentialId: number
+  email?: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  errors: number
+}

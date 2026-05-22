@@ -12,8 +12,10 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
+use super::client_keys::SharedClientKeyManager;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
+use super::usage_stats::SharedAggregator;
 use crate::common::auth;
 
 /// Admin API 共享状态
@@ -25,6 +27,10 @@ pub struct AdminState {
     pub api_key: Arc<RwLock<String>>,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 客户端 Key 管理器（与 anthropic 路由共享）
+    pub client_keys: SharedClientKeyManager,
+    /// 用量聚合器（与 anthropic 路由共享）
+    pub usage_aggregator: SharedAggregator,
 }
 
 impl AdminState {
@@ -32,11 +38,15 @@ impl AdminState {
         admin_api_key: impl Into<String>,
         api_key: Arc<RwLock<String>>,
         service: AdminService,
+        client_keys: SharedClientKeyManager,
+        usage_aggregator: SharedAggregator,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
             api_key,
             service: Arc::new(service),
+            client_keys,
+            usage_aggregator,
         }
     }
 }

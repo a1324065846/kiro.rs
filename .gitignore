@@ -11,4 +11,12 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+# 客户端 Key 分发（含明文 csk_*，绝对不能提交）
+/client_api_keys.json
+# 按天滚动的请求用量日志
+/usage_log.*.jsonl
+/usage_stats.json
+# 在线更新产生的暂存二进制和备份
+*.staged-*
+*.backup
 .ace-tool/

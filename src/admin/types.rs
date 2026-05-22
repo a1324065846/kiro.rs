@@ -488,6 +488,64 @@ pub struct UpdateAdminKeyRequest {
     pub new_key: String,
 }
 
+// ============ 客户端 API Key 分发 ============
+
+/// 客户端 Key 列表项（脱敏展示）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeyItem {
+    pub id: u64,
+    /// 脱敏后的 Key 展示（如 csk_abcd...mnop）
+    pub masked_key: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub disabled: bool,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    pub total_calls: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub total_cache_read_tokens: u64,
+}
+
+/// 客户端 Key 列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeysResponse {
+    pub total: usize,
+    pub keys: Vec<ClientKeyItem>,
+}
+
+/// 创建客户端 Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateClientKeyRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateClientKeyResponse {
+    pub id: u64,
+    pub key: String,
+    pub name: String,
+    pub created_at: String,
+}
+
+/// 更新客户端 Key 元数据
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClientKeyRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
 // ============ IdC 设备授权登录 ============
 
 /// 发起 IdC 设备授权请求

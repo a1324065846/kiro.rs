@@ -40,9 +40,11 @@ import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+  /** 当作为 Tab 嵌入到 App 中时为 true：隐藏自带顶栏与外层布局，由父 App 提供 */
+  embedded?: boolean
 }
 
-export function Dashboard({ onLogout }: DashboardProps) {
+export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false)
@@ -479,95 +481,104 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   return (
-    <div className="min-h-screen">
-      {/* 顶部毛玻璃导航条 */}
-      <header className="sticky top-0 z-40 w-full glass">
-        <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-2.5">
-            <img
-              src="/admin/kirors.png"
-              alt="Kiro"
-              className="h-10 w-10 object-contain"
-              draggable={false}
-            />
-            <span className="font-semibold tracking-tight">Kiro Admin</span>
+    <div className={embedded ? '' : 'min-h-screen'}>
+      {/* 顶部毛玻璃导航条（仅独立模式渲染；嵌入模式由外层 App 提供顶栏） */}
+      {!embedded && (
+        <header className="sticky top-0 z-40 w-full glass">
+          <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
+            <div className="flex items-center gap-2.5">
+              <img
+                src="/admin/kirors.png"
+                alt="Kiro"
+                className="h-10 w-10 object-contain"
+                draggable={false}
+              />
+              <span className="font-semibold tracking-tight">Kiro Admin</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleToggleLoadBalancing}
+                disabled={isLoadingMode || isSettingMode}
+                title="切换负载均衡模式"
+              >
+                <Activity className="h-3.5 w-3.5" />
+                {isLoadingMode ? '加载中…' : (loadBalancingData?.mode === 'priority' ? '优先级' : '均衡负载')}
+              </Button>
+              <Button variant="ghost" size="icon" onClick={toggleDarkMode} title="切换主题">
+                {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              </Button>
+              <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新">
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setImageUpdateDialogOpen(true)}
+                title={
+                  updateCheck?.hasUpdate
+                    ? `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
+                    : '镜像在线更新'
+                }
+                className="relative"
+              >
+                <UploadCloud className="h-4 w-4" />
+                {updateCheck?.hasUpdate && (
+                  <span className="absolute right-1 top-1 inline-flex h-2 w-2 items-center justify-center">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
+                  </span>
+                )}
+              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="icon" title="设置">
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      setKeyEditMode('admin')
+                      setNewAdminKey('')
+                      setShowAdminKeyPlain(false)
+                      setAdminKeyDialogOpen(true)
+                    }}
+                  >
+                    <Key />修改 Admin API Key（管理面板登录）
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      setKeyEditMode('api')
+                      setNewAdminKey('')
+                      setShowAdminKeyPlain(false)
+                      setAdminKeyDialogOpen(true)
+                    }}
+                  >
+                    <Key />修改业务 API Key（客户端 /v1 调用）
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
+                <LogOut className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
-          <div className="flex items-center gap-1.5">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
-            >
-              <Activity className="h-3.5 w-3.5" />
-              {isLoadingMode ? '加载中…' : (loadBalancingData?.mode === 'priority' ? '优先级' : '均衡负载')}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode} title="切换主题">
-              {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新">
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setImageUpdateDialogOpen(true)}
-              title={
-                updateCheck?.hasUpdate
-                  ? `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
-                  : '镜像在线更新'
-              }
-              className="relative"
-            >
-              <UploadCloud className="h-4 w-4" />
-              {updateCheck?.hasUpdate && (
-                <span className="absolute right-1 top-1 inline-flex h-2 w-2 items-center justify-center">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-                  <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
-                </span>
-              )}
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" title="设置">
-                  <Settings className="h-4 w-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    setKeyEditMode('admin')
-                    setNewAdminKey('')
-                    setShowAdminKeyPlain(false)
-                    setAdminKeyDialogOpen(true)
-                  }}
-                >
-                  <Key />修改 Admin API Key（管理面板登录）
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    setKeyEditMode('api')
-                    setNewAdminKey('')
-                    setShowAdminKeyPlain(false)
-                    setAdminKeyDialogOpen(true)
-                  }}
-                >
-                  <Key />修改业务 API Key（客户端 /v1 调用）
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
-              <LogOut className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      </header>
+        </header>
+      )}
 
       {/* 主内容 */}
-      <main ref={gridRef} className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
-        {/* 大标题区 */}
+      <main
+        ref={gridRef}
+        className={
+          embedded
+            ? ''
+            : 'mx-auto max-w-[1400px] px-4 md:px-8 py-8'
+        }
+      >
+        {/* 大标题 */}
         <div className="mb-6 flex items-end justify-between gap-4">
           <div>
             <h1 className="text-[28px] font-semibold tracking-tight leading-tight">凭据管理</h1>

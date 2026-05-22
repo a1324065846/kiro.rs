@@ -1,7 +1,10 @@
 //! Anthropic API Handler 函数
 
 use std::convert::Infallible;
+use std::time::Instant;
 
+use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -10,11 +13,12 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
+use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
@@ -22,7 +26,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
-use super::middleware::AppState;
+use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -30,6 +34,76 @@ use super::types::{
 };
 use super::websearch;
 use crate::anthropic::cache;
+
+/// 请求结束时记录用量的钩子
+///
+/// 在 handler 入口构造，调用 [`Self::record`] 时把当次请求的 input/output token、
+/// 命中的上游凭据 ID、状态写入：
+/// - `usage_log.YYYY-MM-DD.jsonl`（持久化历史）
+/// - 内存聚合器（仪表盘趋势）
+/// - 客户端 Key 计数（按 Key 累计）
+#[derive(Clone)]
+pub(crate) struct UsageRecordHook {
+    pub recorder: Option<SharedRecorder>,
+    pub aggregator: Option<SharedAggregator>,
+    pub client_keys: Option<SharedClientKeyManager>,
+    pub key_id: u64,
+    pub model: String,
+    pub started_at: Instant,
+}
+
+impl UsageRecordHook {
+    pub fn from_state(state: &AppState, key_id: u64, model: String) -> Self {
+        Self {
+            recorder: state.usage_recorder.clone(),
+            aggregator: state.usage_aggregator.clone(),
+            client_keys: state.client_keys.clone(),
+            key_id,
+            model,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn record(
+        &self,
+        credential_id: u64,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_creation_tokens: i32,
+        cache_read_tokens: i32,
+        status: &str,
+    ) {
+        let rec = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: self.key_id,
+            credential_id,
+            model: self.model.clone(),
+            input_tokens: input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+            cache_read_tokens: cache_read_tokens.max(0) as u64,
+            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            status: status.to_string(),
+        };
+        if let Some(r) = &self.recorder {
+            r.record(&rec);
+        }
+        if let Some(a) = &self.aggregator {
+            a.ingest(&rec);
+        }
+        if status == "success" && self.key_id != 0 {
+            if let Some(m) = &self.client_keys {
+                m.record_usage(
+                    self.key_id,
+                    rec.input_tokens,
+                    rec.output_tokens,
+                    rec.cache_creation_tokens,
+                    rec.cache_read_tokens,
+                );
+            }
+        }
+    }
+}
 
 /// 从 HeaderMap 中提取 API Key（用于缓存隔离）
 fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
@@ -243,6 +317,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
@@ -253,11 +328,13 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
+            hook.record(0, 0, 0, 0, 0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -284,7 +361,11 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
+        let status = if resp.status().is_success() { "success" } else { "error" };
+        hook.record(0, input_tokens, 0, 0, 0, status);
+        return resp;
     }
 
     // 转换请求
@@ -300,6 +381,7 @@ pub async fn post_messages(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
+            hook.record(0, 0, 0, 0, 0, "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -318,6 +400,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
+            hook.record(0, 0, 0, 0, 0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -373,6 +456,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             cache_result,
+            hook,
         )
         .await
     } else {
@@ -386,6 +470,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             cache_result,
+            hook,
         )
         .await
     }
@@ -400,12 +485,18 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_result: cache::CacheResult,
+    hook: UsageRecordHook,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let call_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            hook.record(0, input_tokens, 0, 0, 0, "error");
+            return map_provider_error(e);
+        }
     };
+    let response = call_result.response;
+    let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
     let mut ctx = if cache::is_redis_available() {
@@ -418,7 +509,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -443,6 +534,8 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    hook: UsageRecordHook,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -455,8 +548,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id)| async move {
             if finished {
                 return None;
             }
@@ -493,26 +586,28 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
+                            // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
+                            record_stream_usage(&hook, &ctx, credential_id, "error");
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)))
                         }
                         None => {
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
+                            record_stream_usage(&hook, &ctx, credential_id, "success");
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)))
                         }
                     }
                 }
@@ -520,7 +615,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id)))
                 }
             }
         },
@@ -528,6 +623,27 @@ fn create_sse_stream(
     .flatten();
 
     initial_stream.chain(processing_stream)
+}
+
+/// 从 StreamContext 提取最终用量并写入 hook
+fn record_stream_usage(
+    hook: &UsageRecordHook,
+    ctx: &StreamContext,
+    credential_id: u64,
+    status: &str,
+) {
+    let input = ctx
+        .context_input_tokens
+        .unwrap_or(ctx.input_tokens)
+        .max(ctx.cache_result.uncached_input_tokens);
+    hook.record(
+        credential_id,
+        input,
+        ctx.output_tokens,
+        ctx.cache_result.cache_creation_input_tokens,
+        ctx.cache_result.cache_read_input_tokens,
+        status,
+    );
 }
 
 use super::converter::get_context_window_size;
@@ -541,18 +657,25 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_result: cache::CacheResult,
+    hook: UsageRecordHook,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let call_result = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            hook.record(0, input_tokens, 0, 0, 0, "error");
+            return map_provider_error(e);
+        }
     };
+    let response = call_result.response;
+    let credential_id = call_result.credential_id;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
+            hook.record(credential_id, input_tokens, 0, 0, 0, "error");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -717,6 +840,14 @@ async fn handle_non_stream_request(
         }
     });
 
+    hook.record(
+        credential_id,
+        final_input_tokens,
+        output_tokens,
+        cache_result.cache_creation_input_tokens,
+        cache_result.cache_read_input_tokens,
+        "success",
+    );
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -758,6 +889,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
+    Extension(_key_ctx): Extension<KeyContext>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -785,6 +917,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
@@ -795,12 +928,14 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
+            hook.record(0, 0, 0, 0, 0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -827,7 +962,10 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let status = if resp.status().is_success() { "success" } else { "error" };
+        hook.record(0, input_tokens, 0, 0, 0, status);
+        return resp;
     }
 
     // 转换请求
@@ -843,6 +981,7 @@ pub async fn post_messages_cc(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
+            hook.record(0, 0, 0, 0, 0, "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -861,6 +1000,7 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
+            hook.record(0, 0, 0, 0, 0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -915,6 +1055,8 @@ pub async fn post_messages_cc(
             cache_result,
             thinking_enabled,
             tool_name_map,
+            hook,
+            total_input_tokens,
         )
         .await
     } else {
@@ -928,6 +1070,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             cache_result,
+            hook,
         )
         .await
     }
@@ -944,19 +1087,26 @@ async fn handle_stream_request_buffered(
     cache_result: cache::CacheResult,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    fallback_input_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let call_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            hook.record(0, fallback_input_tokens, 0, 0, 0, "error");
+            return map_provider_error(e);
+        }
     };
+    let response = call_result.response;
+    let credential_id = call_result.credential_id;
 
     // 创建缓冲流处理上下文
     let ctx =
         BufferedStreamContext::new_with_cache(model, cache_result, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -978,6 +1128,8 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    hook: UsageRecordHook,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -988,8 +1140,10 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            hook,
+            credential_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id)| async move {
             if finished {
                 return None;
             }
@@ -1004,7 +1158,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id)));
                     }
 
                     // 然后处理数据流
@@ -1035,20 +1189,24 @@ fn create_buffered_sse_stream(
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                let (i, o, cc, cr) = ctx.final_usage();
+                                hook.record(credential_id, i, o, cc, cr, "error");
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
+                                let (i, o, cc, cr) = ctx.final_usage();
+                                hook.record(credential_id, i, o, cc, cr, "success");
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)));
                             }
                         }
                     }
