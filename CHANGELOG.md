@@ -6,9 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.5.3] - 2026-05-30
+## [0.5.4] - 2026-05-30
 
 主题：新增**请求链路追踪（Trace）+ 「请求日志」排查页面**。此前 `/v1/messages` 的失败链路几乎不可观测——provider 重试循环里每跳失败（402 禁用 / 429 风控冷却 / 401/403 鉴权 / 5xx / 网络错误）只有 `tracing::warn!` 日志，handler 最终只写一条 `UsageRecord` 且失败时 `credential_id=0`、status 仅 success/error，无错误类型、无重试次数、无上游错误体；流式中途断开也只记 `error`。这一版把每个外部请求的完整重试链路（含每跳命中凭据、HTTP 状态码、失败分类、上游错误体片段、耗时）落到 SQLite，并提供可筛选、可展开链路的前端页面，专门用于排查"中断"类问题。配套加日志治理（trace 开关 / 保留天数可配且运行时可改），以及一批凭据卡片交互改进（拖拽排序优先级、失败日志详情弹框、卡片等高对齐等）。
+
+> 0.5.3 因发布间隔过短被合并进 0.5.4，请直接使用 0.5.4。下方为合并后的完整内容。
+
+### 🛠 修复 — 凭据失败详情按 attempt 级查询
+
+- **覆盖"中间跳失败但整体成功"的失败记录**：此前凭据失败详情弹框用 `credentialId`（最终凭据）+ `onlyFailed`（最终状态）过滤，导致"某凭据某一跳失败、但请求最终被其他凭据救回成功"的记录查不到——而这正是凭据因失败过多被禁用的典型成因。`TraceQuery` 新增 `failed_attempt_credential_id`，用 `EXISTS` 子查询匹配 `trace_attempts` 里该凭据 `outcome != 'success'` 的跳（不论 trace 最终状态）；`GET /api/admin/traces` 新增 `failedAttemptCredentialId` 参数。前端弹框改用该维度查询，`FailureRow` 聚焦"该凭据失败的那一跳"展示 outcome / HTTP / 错误体，整条 trace 最终成功时标注"本次请求最终由其他凭据成功"。
 
 ### ✨ 新功能 — 请求链路追踪（尝试级）
 
